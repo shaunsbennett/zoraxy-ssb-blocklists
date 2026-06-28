@@ -61,10 +61,10 @@ def parse_config_arg():
             payload = {
                 "id": PLUGIN_ID,
                 "name": PLUGIN_NAME,
-                "author": "Sermo",
-                "author_contact": "",
+                "author": "shaunsbennett",
+                "author_contact": "https://github.com/shaunsbennett/zoraxy-ssb-blocklists",
                 "description": "Import URL blocklists and block matching client IPs.",
-                "url": "",
+                "url": "https://github.com/shaunsbennett/zoraxy-ssb-blocklists",
                 "type": 0,
                 "version_major": VERSION[0],
                 "version_minor": VERSION[1],
