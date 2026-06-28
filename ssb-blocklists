@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+import ipaddress
+import json
+import os
+import signal
+import socketserver
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+PLUGIN_ID = "ssb-blocklists"
+PLUGIN_NAME = "SSB Blocklists"
+VERSION = (0, 1, 0)
+DYNAMIC_SNIFF = "/d_sniff"
+DYNAMIC_INGRESS = "/d_block"
+UI_PATH = "/ui"
+
+
+def now():
+    return int(time.time())
+
+
+CONFIG_LOCK = threading.RLock()
+STATE = {
+    "sources": [],
+    "prefixes": [],
+    "running": True,
+    "config_path": None,
+    "cache_dir": None,
+    "stats": {
+        "started": now(),
+        "sniff_total": 0,
+        "pass_total": 0,
+        "drop_total": 0,
+        "unknown_ip_total": 0,
+        "error_total": 0,
+        "last_drop": None,
+        "last_pass": None,
+    },
+}
+
+
+def plugin_dir():
+    return Path(os.path.realpath(sys.argv[0])).parent
+
+
+def iso(ts):
+    if not ts:
+        return ""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def parse_config_arg():
+    for idx, arg in enumerate(sys.argv):
+        if arg == "-introspect":
+            payload = {
+                "id": PLUGIN_ID,
+                "name": PLUGIN_NAME,
+                "author": "Sermo",
+                "author_contact": "",
+                "description": "Import URL blocklists and block matching client IPs.",
+                "url": "",
+                "type": 0,
+                "version_major": VERSION[0],
+                "version_minor": VERSION[1],
+                "version_patch": VERSION[2],
+                "dynamic_capture_sniff": DYNAMIC_SNIFF,
+                "dynamic_capture_ingress": DYNAMIC_INGRESS,
+                "ui_path": UI_PATH,
+            }
+            print(json.dumps(payload, indent=2))
+            sys.exit(0)
+        if arg.startswith("-configure="):
+            return json.loads(arg[len("-configure="):])
+        if arg == "-configure" and idx + 1 < len(sys.argv):
+            return json.loads(sys.argv[idx + 1])
+    raise SystemExit("missing -configure payload")
+
+
+def default_config():
+    return {
+        "settings": {
+            "user_agent": f"{PLUGIN_ID}/{VERSION[0]}.{VERSION[1]}.{VERSION[2]}",
+            "block_status": 403,
+            "client_ip_headers": [],
+        },
+        "sources": [],
+    }
+
+
+def load_config():
+    path = STATE["config_path"]
+    if not path.exists():
+        cfg = default_config()
+        save_config(cfg)
+        return cfg
+    with path.open("r", encoding="utf-8") as handle:
+        cfg = json.load(handle)
+    cfg.setdefault("settings", {})
+    cfg.setdefault("sources", [])
+    cfg["settings"].setdefault("user_agent", default_config()["settings"]["user_agent"])
+    cfg["settings"].setdefault("block_status", 403)
+    cfg["settings"].setdefault("client_ip_headers", [])
+    return cfg
+
+
+def save_config(cfg):
+    path = STATE["config_path"]
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(cfg, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, path)
+
+
+def clean_source(src):
+    src = dict(src)
+    src.setdefault("id", str(now()))
+    src.setdefault("name", src.get("url", "Source"))
+    src.setdefault("url", "")
+    src.setdefault("format", "auto")
+    src.setdefault("interval_hours", 24)
+    src.setdefault("enabled", True)
+    src.setdefault("last_fetch", 0)
+    src.setdefault("next_fetch", 0)
+    src.setdefault("last_status", "never")
+    src.setdefault("last_error", "")
+    src.setdefault("entry_count", 0)
+    src["interval_hours"] = max(1, int(src.get("interval_hours") or 1))
+    return src
+
+
+def source_cache_path(source_id):
+    return STATE["cache_dir"] / f"{source_id}.cidr"
+
+
+def zoraxy_conf_dir():
+    return plugin_dir().parent.parent / "config" / "conf"
+
+
+def load_json_file(path, fallback):
+    try:
+        if not path.exists():
+            return fallback
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return fallback
+
+
+def zoraxy_associations():
+    conf_dir = zoraxy_conf_dir()
+    plugin_groups = load_json_file(conf_dir / "plugin_groups.json", {})
+    tags = sorted(
+        tag for tag, plugins in plugin_groups.items()
+        if PLUGIN_ID in (plugins or [])
+    )
+    proxies = []
+    proxy_dir = conf_dir / "proxy"
+    if proxy_dir.exists():
+        for path in sorted(proxy_dir.glob("*.config")):
+            data = load_json_file(path, None)
+            if not isinstance(data, dict):
+                continue
+            proxy_tags = data.get("Tags") or []
+            matched_tags = sorted(set(tags).intersection(proxy_tags))
+            if not matched_tags:
+                continue
+            proxies.append({
+                "name": data.get("RootOrMatchingDomain") or path.stem,
+                "file": path.name,
+                "tags": proxy_tags,
+                "matched_tags": matched_tags,
+                "disabled": bool(data.get("Disabled", False)),
+            })
+    return {
+        "plugin_id": PLUGIN_ID,
+        "plugin_name": PLUGIN_NAME,
+        "suggested_tag": PLUGIN_ID,
+        "tags": tags,
+        "proxies": proxies,
+    }
+
+
+def parse_token(token):
+    token = token.strip().strip('"').strip("'")
+    if not token or token.startswith("#"):
+        return None
+    if "#" in token:
+        token = token.split("#", 1)[0].strip()
+    try:
+        if "/" in token:
+            return ipaddress.ip_network(token, strict=False)
+        ip = ipaddress.ip_address(token)
+        mask = 32 if ip.version == 4 else 128
+        return ipaddress.ip_network(f"{ip}/{mask}", strict=False)
+    except ValueError:
+        return None
+
+
+def parse_plain(text):
+    nets = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.replace(",", " ")
+        for token in line.split():
+            net = parse_token(token)
+            if net is not None:
+                nets.append(net)
+    return nets
+
+
+def parse_jsonish(text):
+    nets = []
+    stripped = text.lstrip()
+    if stripped.startswith("["):
+        data = json.loads(text)
+        for item in data:
+            if isinstance(item, str):
+                net = parse_token(item)
+            elif isinstance(item, dict):
+                net = parse_token(item.get("cidr") or item.get("ip") or item.get("network") or "")
+            else:
+                net = None
+            if net is not None:
+                nets.append(net)
+        return nets
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            net = parse_token(item.get("cidr") or item.get("ip") or item.get("network") or "")
+            if net is not None:
+                nets.append(net)
+    return nets
+
+
+def parse_blocklist(text, fmt):
+    if fmt == "plain":
+        return parse_plain(text)
+    if fmt in ("json", "ndjson"):
+        return parse_jsonish(text)
+    try:
+        nets = parse_jsonish(text)
+        if nets:
+            return nets
+    except Exception:
+        pass
+    return parse_plain(text)
+
+
+def write_source_cache(source_id, nets):
+    unique = sorted({str(n) for n in nets}, key=lambda v: (":" in v, v))
+    path = source_cache_path(source_id)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        for item in unique:
+            handle.write(item + "\n")
+    os.replace(tmp, path)
+    return len(unique)
+
+
+def read_source_cache(source_id):
+    path = source_cache_path(source_id)
+    if not path.exists():
+        return []
+    return [net for net in parse_plain(path.read_text(encoding="utf-8"))]
+
+
+def remove_stale_source_caches(old_cfg, new_cfg):
+    old_ids = {str(clean_source(src)["id"]) for src in old_cfg.get("sources", [])}
+    new_ids = {str(clean_source(src)["id"]) for src in new_cfg.get("sources", [])}
+    for source_id in old_ids - new_ids:
+        try:
+            source_cache_path(source_id).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def fetch_source(src, settings):
+    req = urllib.request.Request(src["url"], headers={"User-Agent": settings["user_agent"]})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        body = response.read(10 * 1024 * 1024)
+        charset = response.headers.get_content_charset() or "utf-8"
+        text = body.decode(charset, errors="replace")
+        nets = parse_blocklist(text, src["format"])
+        if not nets:
+            raise ValueError("no IP/CIDR entries found")
+        count = write_source_cache(src["id"], nets)
+        return response.status, count
+
+
+def rebuild_matcher(cfg):
+    prefixes_by_value = {}
+    for src in cfg["sources"]:
+        if src.get("enabled", True):
+            for net in read_source_cache(src["id"]):
+                prefixes_by_value[str(net)] = net
+    prefixes = sorted(
+        prefixes_by_value.values(),
+        key=lambda net: (net.version, int(net.network_address), net.prefixlen),
+    )
+    with CONFIG_LOCK:
+        STATE["prefixes"] = prefixes
+
+
+def refresh_due_sources(force=False):
+    with CONFIG_LOCK:
+        cfg = load_config()
+    changed = False
+    settings = cfg["settings"]
+    for idx, src in enumerate([clean_source(s) for s in cfg["sources"]]):
+        cfg["sources"][idx] = src
+        if not src.get("enabled", True):
+            continue
+        if not force and src.get("next_fetch", 0) > now():
+            continue
+        try:
+            status, count = fetch_source(src, settings)
+            src["last_status"] = f"ok:{status}"
+            src["last_error"] = ""
+            src["entry_count"] = count
+        except Exception as exc:
+            src["last_status"] = "error"
+            src["last_error"] = str(exc)
+        src["last_fetch"] = now()
+        src["next_fetch"] = now() + src["interval_hours"] * 3600
+        changed = True
+
+    if changed:
+        with CONFIG_LOCK:
+            save_config(cfg)
+        rebuild_matcher(cfg)
+    return cfg
+
+
+def scheduler():
+    while STATE["running"]:
+        try:
+            refresh_due_sources(False)
+        except Exception as exc:
+            print(f"scheduler error: {exc}", file=sys.stderr)
+        for _ in range(60):
+            if not STATE["running"]:
+                return
+            time.sleep(1)
+
+
+def client_ip_from_headers(headers, cfg):
+    settings = cfg.get("settings", {})
+    for header in settings.get("client_ip_headers", []):
+        values = headers.get(header) or headers.get(header.lower()) or []
+        if isinstance(values, str):
+            values = [values]
+        for value in values:
+            candidate = value.split(",", 1)[0].strip()
+            try:
+                return ipaddress.ip_address(candidate)
+            except ValueError:
+                pass
+    return None
+
+
+def client_ip(payload, cfg):
+    ip = client_ip_from_headers(payload.get("header", {}), cfg)
+    if ip is not None:
+        return ip
+    remote = payload.get("remote_addr", "")
+    host = remote.rsplit(":", 1)[0] if ":" in remote and not remote.startswith("[") else remote
+    host = host.strip("[]")
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
+
+
+def is_blocked(ip):
+    if ip is None:
+        return False
+    with CONFIG_LOCK:
+        prefixes = list(STATE["prefixes"])
+    return any(ip in net for net in prefixes if net.version == ip.version)
+
+
+def bump_stat(name, amount=1):
+    with CONFIG_LOCK:
+        STATE["stats"][name] = STATE["stats"].get(name, 0) + amount
+
+
+def set_stat(name, value):
+    with CONFIG_LOCK:
+        STATE["stats"][name] = value
+
+
+def stats_snapshot():
+    with CONFIG_LOCK:
+        stats = dict(STATE["stats"])
+        stats["loaded_entries"] = len(STATE["prefixes"])
+    return stats
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = f"{PLUGIN_ID}/{VERSION[0]}.{VERSION[1]}.{VERSION[2]}"
+
+    def log_message(self, fmt, *args):
+        print("%s - %s" % (self.address_string(), fmt % args))
+
+    def read_json(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return {}
+        return json.loads(self.rfile.read(length).decode("utf-8"))
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if path in (UI_PATH, UI_PATH + "/index.html"):
+            return self.send_ui()
+        if path == UI_PATH + "/api/config":
+            with CONFIG_LOCK:
+                cfg = load_config()
+                total = len(STATE["prefixes"])
+            return self.send_json({"config": cfg, "total_entries": total, "stats": stats_snapshot()})
+        if path == UI_PATH + "/api/source":
+            params = parse_qs(parsed.query)
+            source_id = (params.get("id") or [""])[0]
+            if not source_id:
+                return self.send_json({"error": "missing source id"}, 400)
+            entries = [str(net) for net in read_source_cache(source_id)]
+            return self.send_json({"id": source_id, "entries": entries, "count": len(entries)})
+        if path == UI_PATH + "/api/associations":
+            return self.send_json(zoraxy_associations())
+        self.send_error(404)
+
+    def do_HEAD(self):
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path in (UI_PATH, UI_PATH + "/index.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            return
+        self.send_error(404)
+
+    def do_POST(self):
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path == DYNAMIC_SNIFF:
+            return self.handle_sniff()
+        if path == DYNAMIC_INGRESS:
+            return self.handle_block()
+        if path == UI_PATH + "/api/config":
+            data = self.read_json()
+            cfg = default_config()
+            cfg["settings"].update(data.get("settings", {}))
+            cfg["sources"] = [clean_source(s) for s in data.get("sources", [])]
+            with CONFIG_LOCK:
+                old_cfg = load_config()
+                save_config(cfg)
+            remove_stale_source_caches(old_cfg, cfg)
+            rebuild_matcher(cfg)
+            return self.send_json({"ok": True})
+        if path == UI_PATH + "/api/refresh":
+            cfg = refresh_due_sources(True)
+            return self.send_json({"ok": True, "config": cfg, "total_entries": len(STATE["prefixes"])})
+        self.send_error(404)
+
+    def handle_sniff(self):
+        bump_stat("sniff_total")
+        try:
+            payload = self.read_json()
+            with CONFIG_LOCK:
+                cfg = load_config()
+            ip = client_ip(payload, cfg)
+            event = {
+                "time": now(),
+                "ip": str(ip) if ip else "",
+                "host": payload.get("host", ""),
+                "uri": payload.get("request_uri", ""),
+            }
+            if ip is None:
+                bump_stat("unknown_ip_total")
+                bump_stat("pass_total")
+                set_stat("last_pass", event)
+                self.send_response(501)
+                self.end_headers()
+                self.wfile.write(b"SKIP")
+                return
+            if is_blocked(ip):
+                bump_stat("drop_total")
+                set_stat("last_drop", event)
+                print(f"blocked sniff match ip={ip} host={payload.get('host','')} uri={payload.get('request_uri','')}")
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+            else:
+                bump_stat("pass_total")
+                set_stat("last_pass", event)
+                self.send_response(501)
+                self.end_headers()
+                self.wfile.write(b"SKIP")
+        except Exception as exc:
+            bump_stat("error_total")
+            print(f"sniff error: {exc}", file=sys.stderr)
+            self.send_response(501)
+            self.end_headers()
+            self.wfile.write(b"SKIP")
+
+    def handle_block(self):
+        with CONFIG_LOCK:
+            cfg = load_config()
+        status = int(cfg.get("settings", {}).get("block_status", 403))
+        body = b"Forbidden\n"
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_ui(self):
+        body = UI_HTML.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+UI_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="zoraxy.csrf.Token" content="{{.csrfToken}}">
+<title>SSB Blocklists</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#f7f8fb;color:#20242a}
+main{max-width:1180px;margin:0 auto;padding:24px}
+h1{font-size:24px;margin:0 0 16px}
+.bar{display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
+button{border:1px solid #b9c0ca;background:#fff;border-radius:6px;padding:8px 10px;cursor:pointer}
+button.primary{background:#1f6feb;color:#fff;border-color:#1f6feb}
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d8dde6}
+th,td{border-bottom:1px solid #e5e8ef;text-align:left;padding:8px;font-size:13px;vertical-align:top}
+th{background:#eef1f6;font-weight:600}
+input,select{width:100%;box-sizing:border-box;border:1px solid #c7ced8;border-radius:5px;padding:7px;background:#fff}
+.small{max-width:92px}.medium{max-width:150px}.status{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.muted{color:#667085}.danger{color:#b42318}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:0 0 16px}
+.stat{background:#fff;border:1px solid #d8dde6;border-radius:6px;padding:10px}
+.stat b{display:block;font-size:20px;line-height:1.2}.stat span{font-size:12px;color:#667085}
+.panel{background:#fff;border:1px solid #d8dde6;border-radius:6px;padding:12px;margin:0 0 16px}
+.panel h2{font-size:16px;margin:0 0 8px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
+.chip{display:inline-block;background:#eef1f6;border:1px solid #d8dde6;border-radius:999px;padding:3px 8px;font-size:12px}
+.assoc-list{margin:8px 0 0;padding-left:18px}
+textarea{width:100%;min-height:260px;box-sizing:border-box;margin-top:14px;border:1px solid #c7ced8;border-radius:6px;padding:10px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;background:#fff}
+</style>
+</head>
+<body>
+<main>
+<h1>SSB Blocklists</h1>
+<div class="bar">
+  <button class="primary" type="button" onclick="addSource()">Add Source</button>
+  <button type="button" onclick="save()">Save</button>
+  <button type="button" onclick="refreshNow()">Refresh Now</button>
+  <span id="summary" class="muted"></span>
+  <span id="saveStatus" class="muted"></span>
+</div>
+<div class="panel">
+  <h2>Zoraxy Attachment</h2>
+  <div id="associationPanel" class="muted">Loading association details...</div>
+</div>
+<div class="stats">
+  <div class="stat"><b id="statDrop">0</b><span>Dropped</span></div>
+  <div class="stat"><b id="statPass">0</b><span>Passed</span></div>
+  <div class="stat"><b id="statSniff">0</b><span>Inspected</span></div>
+  <div class="stat"><b id="statUnknown">0</b><span>Unknown IP</span></div>
+  <div class="stat"><b id="statErrors">0</b><span>Errors</span></div>
+  <div class="stat"><b id="statLoaded">0</b><span>Loaded Entries</span></div>
+</div>
+<div id="lastDecision" class="muted"></div>
+<table>
+<thead><tr><th>Enabled</th><th>Name</th><th>URL</th><th>Format</th><th>Hours</th><th>Entries</th><th>Last Fetch</th><th>Status</th><th></th></tr></thead>
+<tbody id="rows"></tbody>
+</table>
+<textarea id="entries" readonly hidden></textarea>
+</main>
+<script>
+let cfg = {settings:{}, sources:[]};
+const apiBase = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
+function getCsrfToken(){
+  const readToken = (doc) => {
+    try {
+      const token = doc.querySelector('meta[name="zoraxy.csrf.Token"]')?.content || '';
+      return token.includes('{{') ? '' : token;
+    } catch (_err) {
+      return '';
+    }
+  };
+  return readToken(document) || readToken(window.parent?.document) || readToken(window.top?.document) || '';
+}
+function id(){return String(Date.now())}
+function esc(s){return String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function setStatus(message, isError=false){
+  const el = document.getElementById('saveStatus');
+  el.textContent = message;
+  el.className = isError ? 'danger' : 'muted';
+}
+async function load(){
+  try {
+    const r = await fetch(apiBase + 'api/config');
+    if(!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    cfg = data.config; render(data.total_entries); renderStats(data.stats || {});
+    loadAssociations();
+  } catch (err) {
+    setStatus(`Load failed: ${err.message || err}`, true);
+  }
+}
+async function loadAssociations(){
+  const panel = document.getElementById('associationPanel');
+  try {
+    const r = await fetch(apiBase + 'api/associations');
+    if(!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    const tagHtml = data.tags.length
+      ? `<div class="chips">${data.tags.map(t=>`<span class="chip">${esc(t)}</span>`).join('')}</div>`
+      : `<div>No plugin tag is associated with ${esc(data.plugin_name)}.</div>
+         <button type="button" onclick="autoCreatePluginTag('${esc(data.suggested_tag)}')">Create ${esc(data.suggested_tag)} tag</button>`;
+    const proxyHtml = data.proxies.length
+      ? `<ul class="assoc-list">${data.proxies.map(p=>`<li><b>${esc(p.name)}</b>${p.disabled?' <span class="danger">(disabled)</span>':''}<br><span class="muted">matched: ${p.matched_tags.map(esc).join(', ')}</span></li>`).join('')}</ul>`
+      : `<div>No proxy hosts are using the associated plugin tag yet.</div>`;
+    panel.innerHTML = `<div><b>Associated plugin tags</b>${tagHtml}</div><div style="margin-top:10px"><b>Proxies using those tags</b>${proxyHtml}</div>`;
+  } catch (err) {
+    panel.textContent = `Association lookup failed: ${err.message || err}`;
+    panel.className = 'danger';
+  }
+}
+async function autoCreatePluginTag(tag){
+  setStatus(`Creating tag ${tag}...`);
+  try {
+    const csrfToken = getCsrfToken();
+    if(!csrfToken) throw new Error('CSRF token unavailable; reload the Zoraxy admin page');
+    const body = new URLSearchParams({plugin_id:'ssb-blocklists', tag});
+    const r = await fetch('/api/plugins/groups/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-CSRF-Token':csrfToken},body});
+    if(!r.ok) throw new Error(await r.text());
+    const data = await r.json().catch(()=>({}));
+    if(data.error) throw new Error(data.error);
+    setStatus(`Created tag ${tag}`);
+    await loadAssociations();
+  } catch (err) {
+    setStatus(`Create tag failed: ${err.message || err}`, true);
+  }
+}
+function fmtEvent(e){
+  if(!e) return '';
+  const t = e.time ? new Date(e.time*1000).toISOString() : '';
+  return `${t} ${e.ip || 'unknown'} ${e.host || ''}${e.uri || ''}`;
+}
+function renderStats(stats){
+  document.getElementById('statDrop').textContent = stats.drop_total ?? 0;
+  document.getElementById('statPass').textContent = stats.pass_total ?? 0;
+  document.getElementById('statSniff').textContent = stats.sniff_total ?? 0;
+  document.getElementById('statUnknown').textContent = stats.unknown_ip_total ?? 0;
+  document.getElementById('statErrors').textContent = stats.error_total ?? 0;
+  document.getElementById('statLoaded').textContent = stats.loaded_entries ?? 0;
+  const lastDrop = fmtEvent(stats.last_drop);
+  const lastPass = fmtEvent(stats.last_pass);
+  document.getElementById('lastDecision').textContent = [lastDrop && `Last drop: ${lastDrop}`, lastPass && `Last pass: ${lastPass}`].filter(Boolean).join(' | ');
+}
+function render(total){
+  document.getElementById('summary').textContent = `${cfg.sources.length} sources, ${total ?? 0} merged entries`;
+  document.getElementById('rows').innerHTML = cfg.sources.map((s,i)=>`
+    <tr>
+      <td><input type="checkbox" ${s.enabled?'checked':''} onchange="cfg.sources[${i}].enabled=this.checked"></td>
+      <td><input value="${esc(s.name)}" onchange="cfg.sources[${i}].name=this.value"></td>
+      <td><input value="${esc(s.url)}" onchange="cfg.sources[${i}].url=this.value"></td>
+      <td><select onchange="cfg.sources[${i}].format=this.value">
+        ${['auto','plain','ndjson','json'].map(f=>`<option ${s.format===f?'selected':''}>${f}</option>`).join('')}
+      </select></td>
+      <td><input class="small" type="number" min="1" value="${esc(s.interval_hours)}" onchange="cfg.sources[${i}].interval_hours=Number(this.value)||1"></td>
+      <td>${esc(s.entry_count||0)}</td>
+      <td class="status">${esc(s.last_fetch?new Date(s.last_fetch*1000).toISOString():'')}</td>
+      <td class="status ${s.last_status==='error'?'danger':''}">${esc(s.last_status||'never')}<br><span class="muted">${esc(s.last_error||'')}</span></td>
+      <td><button type="button" onclick="viewEntries(${i})">View</button> <button type="button" onclick="removeSource(${i})">Delete</button></td>
+    </tr>`).join('');
+}
+function addSource(){
+  cfg.sources.push({id:id(),name:'New source',url:'',format:'auto',interval_hours:24,enabled:true});
+  render();
+}
+function removeSource(i){cfg.sources.splice(i,1);render()}
+async function viewEntries(i){
+  const source = cfg.sources[i];
+  const box = document.getElementById('entries');
+  box.hidden = false;
+  box.value = 'Loading entries...';
+  try {
+    const r = await fetch(apiBase + 'api/source?id=' + encodeURIComponent(source.id));
+    if(!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    box.value = data.entries.length ? data.entries.join('\\n') : 'No cached entries for this source. Refresh it first.';
+    setStatus(`${source.name}: ${data.count} cached entries`);
+  } catch (err) {
+    box.value = '';
+    setStatus(`View failed: ${err.message || err}`, true);
+  }
+}
+async function save(){
+  setStatus('Saving...');
+  try {
+    const csrfToken = getCsrfToken();
+    if(!csrfToken) throw new Error('CSRF token unavailable; reload the Zoraxy admin page');
+    const r = await fetch(apiBase + 'api/config',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},body:JSON.stringify(cfg)});
+    if(!r.ok) throw new Error(await r.text());
+    setStatus(`Saved ${new Date().toLocaleTimeString()}`);
+    await load();
+    return true;
+  } catch (err) {
+    setStatus(`Save failed: ${err.message || err}`, true);
+    return false;
+  }
+}
+async function refreshNow(){
+  if(!await save()) return;
+  setStatus('Refreshing...');
+  try {
+    const csrfToken = getCsrfToken();
+    if(!csrfToken) throw new Error('CSRF token unavailable; reload the Zoraxy admin page');
+    const r = await fetch(apiBase + 'api/refresh',{method:'POST',headers:{'X-CSRF-Token':csrfToken}});
+    if(!r.ok) throw new Error(await r.text());
+    setStatus(`Refreshed ${new Date().toLocaleTimeString()}`);
+    await load();
+  } catch (err) {
+    setStatus(`Refresh failed: ${err.message || err}`, true);
+  }
+}
+load();
+</script>
+</body>
+</html>
+"""
+
+
+def main():
+    spec = parse_config_arg()
+    base = plugin_dir()
+    STATE["config_path"] = base / "config.json"
+    STATE["cache_dir"] = base / "cache"
+    STATE["cache_dir"].mkdir(exist_ok=True)
+
+    with CONFIG_LOCK:
+        cfg = load_config()
+    rebuild_matcher(cfg)
+    threading.Thread(target=scheduler, daemon=True).start()
+
+    def stop(_signum, _frame):
+        STATE["running"] = False
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    port = int(spec.get("port", 0))
+    if port <= 0:
+        raise SystemExit("invalid configure port")
+    with socketserver.ThreadingTCPServer(("127.0.0.1", port), Handler) as httpd:
+        httpd.daemon_threads = True
+        print(f"{PLUGIN_NAME} listening on 127.0.0.1:{port}")
+        httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

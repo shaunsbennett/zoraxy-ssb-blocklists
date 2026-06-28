@@ -1,0 +1,22 @@
+{
+  "settings": {
+    "block_status": 403,
+    "client_ip_headers": [],
+    "user_agent": "ssb-blocklists/0.1.0"
+  },
+  "sources": [
+    {
+      "enabled": true,
+      "entry_count": 0,
+      "format": "plain",
+      "id": "spamhaus-drop",
+      "interval_hours": 12,
+      "last_error": "",
+      "last_fetch": 0,
+      "last_status": "never",
+      "name": "Spamhaus DROP",
+      "next_fetch": 0,
+      "url": "https://www.spamhaus.org/drop/drop.txt"
+    }
+  ]
+}
