@@ -3,6 +3,8 @@
 Zoraxy router plugin for importing URL-based IP/CIDR blocklists and blocking
 matching client IPs before requests reach the upstream service.
 
+Built for [tobychui/zoraxy](https://github.com/tobychui/zoraxy).
+
 ## Features
 
 - Multiple URL sources
